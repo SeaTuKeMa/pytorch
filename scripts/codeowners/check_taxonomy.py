@@ -67,6 +67,24 @@ FAILURE_GUIDANCE = {
         "Use the same `# owner:` list on every `# label:` line with these labels, "
         "or give one of the blocks its own label list."
     ),
+    "Reviewers missing from owner lists": (
+        "Add the reported handles to the block's `# owner:` line, or move the "
+        "rule to a block whose owners include them."
+    ),
+    "Unneeded reviewer exceptions": (
+        "Remove the reported entries from REVIEWERS_NOT_OWNERS in "
+        "scripts/codeowners/check_taxonomy.py; their handles are owners now or no "
+        "longer on the rule."
+    ),
+}
+
+# Active rules whose handles are notified without being owners of the rule's label
+# block. These predate the owner lines and are left as they are until the people
+# involved decide; every other rule's handles must be on its block's owner line.
+REVIEWERS_NOT_OWNERS = {
+    "test/functorch/test_aotdispatch.py": frozenset({"@chillee", "@ezyang"}),
+    "torch/_export/serde/schema.py": frozenset({"@sherlocknomad"}),
+    "torch/fx/proxy.py": frozenset({"@zou3519"}),
 }
 
 
@@ -80,6 +98,8 @@ class TaxonomyPattern:
     labels: tuple[str, ...] = ()
     # Handles on the block's `# owner:` line; None when the block has no owner line.
     owners: tuple[str, ...] | None = None
+    # Handles on the rule itself, who GitHub asks for review.
+    reviewers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,8 +268,11 @@ def parse_codeowners(codeowners: Path) -> ParsedCodeowners:
                     )
             if pattern == "/" or any(character in pattern for character in "?[\\"):
                 raise ValueError(f"{location}: invalid taxonomy path: {pattern!r}")
+            reviewers = tuple(owners) if active else ()
             patterns.append(
-                TaxonomyPattern(group, pattern[1:], line_number, labels, block_owners)
+                TaxonomyPattern(
+                    group, pattern[1:], line_number, labels, block_owners, reviewers
+                )
             )
         elif line and not line.startswith("#"):
             raise ValueError(f"{codeowners}:{line_number}: invalid taxonomy entry")
@@ -261,8 +284,12 @@ def parse_codeowners(codeowners: Path) -> ParsedCodeowners:
     return ParsedCodeowners(patterns, section_groups, label_blocks, owner_lines)
 
 
-def find_ownership_errors(parsed: ParsedCodeowners) -> dict[str, list[str]]:
-    """Check that every label block names exactly one owner list."""
+def find_ownership_errors(
+    parsed: ParsedCodeowners,
+    *,
+    reviewers_not_owners: dict[str, frozenset[str]] = REVIEWERS_NOT_OWNERS,
+) -> dict[str, list[str]]:
+    """Check that every label block names one owner list that covers its reviewers."""
     missing_owner_lines = [
         f"CODEOWNERS:{block.line_number} {LABEL_PREFIX} {', '.join(block.labels)}"
         for block in parsed.label_blocks
@@ -286,9 +313,41 @@ def find_ownership_errors(parsed: ParsedCodeowners) -> dict[str, list[str]]:
         if block.owners is not None:
             owners = frozenset(owner.casefold() for owner in block.owners)
             owner_lists[block.labels].add(owners)
+    missing_reviewers = []
+    used_exceptions = set()
+    rule_paths = {pattern.path for pattern in parsed.patterns}
+    for pattern in parsed.patterns:
+        if not pattern.labels or pattern.owners is None:
+            continue
+        owners = {owner.casefold() for owner in pattern.owners}
+        allowed = reviewers_not_owners.get(pattern.path, frozenset())
+        missing = []
+        for reviewer in pattern.reviewers:
+            if reviewer.casefold() in owners:
+                continue
+            if reviewer.casefold() in allowed:
+                used_exceptions.add((pattern.path, reviewer.casefold()))
+            else:
+                missing.append(reviewer)
+        if missing:
+            missing_reviewers.append(
+                f"CODEOWNERS:{pattern.line_number} /{pattern.path}: "
+                f"{' '.join(missing)} not on the block's owner line"
+            )
+    # An exception whose rule still exists but no longer needs it should go; one
+    # whose rule was removed is harmless.
+    unneeded_exceptions = [
+        f"/{path}: {handle}"
+        for path, handles in sorted(reviewers_not_owners.items())
+        if path in rule_paths
+        for handle in sorted(handles)
+        if (path, handle) not in used_exceptions
+    ]
     conflicting_lists = [
         f"{', '.join(labels)}: "
-        + " | ".join(" ".join(owners) or "none" for owners in sorted(map(sorted, lists)))
+        + " | ".join(
+            " ".join(owners) or "none" for owners in sorted(map(sorted, lists))
+        )
         for labels, lists in owner_lists.items()
         if len(lists) > 1
     ]
@@ -297,6 +356,8 @@ def find_ownership_errors(parsed: ParsedCodeowners) -> dict[str, list[str]]:
         "Misplaced owner lines": misplaced_owner_lines,
         "Invalid owner handles": invalid_handles,
         "Label lists with several owner lists": conflicting_lists,
+        "Reviewers missing from owner lists": missing_reviewers,
+        "Unneeded reviewer exceptions": unneeded_exceptions,
     }
 
 
@@ -547,15 +608,17 @@ def main() -> int:
     missing_groups = sorted(declared_group_set - report.groups)
     missing_sections = sorted(declared_group_set - section_group_set)
     undeclared_sections = sorted(section_group_set - declared_group_set)
-    has_errors = bool(missing_groups or missing_sections or undeclared_sections) or any(
-        ownership_errors.values()
-    ) or any(
-        (
-            report.uncovered,
-            report.duplicates,
-            report.stale,
-            report.ineffective,
-            report.source_order_mismatches,
+    has_errors = (
+        bool(missing_groups or missing_sections or undeclared_sections)
+        or any(ownership_errors.values())
+        or any(
+            (
+                report.uncovered,
+                report.duplicates,
+                report.stale,
+                report.ineffective,
+                report.source_order_mismatches,
+            )
         )
     )
     if not args.lintrunner:
@@ -576,7 +639,10 @@ def main() -> int:
             (len(missing_groups), "missing effective surfaces"),
             (len(missing_sections), "missing grouped sections"),
             (len(undeclared_sections), "undeclared grouped sections"),
-            *((len(entries), title.lower()) for title, entries in ownership_errors.items()),
+            *(
+                (len(entries), title.lower())
+                for title, entries in ownership_errors.items()
+            ),
         ]
         failures = [f"{count} {name}" for count, name in failure_counts if count]
         emit_lint_error(
